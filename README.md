@@ -3,7 +3,7 @@
 Server-Sent Events fanout across processes over Redis Pub/Sub.
 
 A client's connection stream lands on whichever process the load balancer picked.
-This makes it reachable from every other one.
+This fanout makes that connection reachable from every other one.
 
 - Local first. The direct user channel claim is the shortcut, full broadcast is the guarantee.
 - One SSE connection per user. SSE connection ownership with healthcheck.
