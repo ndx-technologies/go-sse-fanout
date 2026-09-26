@@ -23,50 +23,30 @@ func main() {
 	owner := ssefanout.OwnerRedis{Config: config, DB: rdb}
 
 	messages := ssefanout.NewHub[UserID, Message](config.WithEvent("message"), pubsub, owner, ParseUser)
-	tasks := ssefanout.NewHub[UserID, Task](config.WithEvent("task"), pubsub, owner, ParseUser)
+	if err := messages.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
 
-	events := []event{messages, tasks}
-	for _, e := range events {
-		if err := e.Start(ctx); err != nil {
-			log.Fatal(err)
+	http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		user, err := UserFromRequest(r)
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
-	}
 
-	http.Handle("/events", SSEHandler{Config: config, PubSub: pubsub, Owner: owner, Events: events})
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+
+		socket := ssefanout.NewSocket(config, pubsub, owner, user, w)
+		messages.Join(user, socket)
+		if err := socket.Subscribe(r.Context()); err != nil {
+			http.Error(w, "cannot stream", http.StatusInternalServerError)
+			return
+		}
+		<-socket.Done()
+	})
+
 	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-type SSEHandler struct {
-	Config ssefanout.Config
-	PubSub ssefanout.PubSub
-	Owner  ssefanout.SocketClaimDB
-	Events []event
-}
-
-func (s SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	user, ok := UserFromRequest(r)
-	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	if _, ok := w.(http.Flusher); !ok {
-		http.Error(w, "sse is not supported", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	socket := ssefanout.NewSocket(s.Config, s.PubSub, s.Owner, user, w)
-	for _, e := range s.Events {
-		e.Join(user, socket)
-	}
-	if err := socket.Subscribe(r.Context()); err != nil {
-		http.Error(w, "cannot stream", http.StatusInternalServerError)
-		return
-	}
-	<-socket.Done()
 }
 ```
 
