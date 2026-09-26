@@ -1,6 +1,6 @@
 # go-sse-fanout
 
-Server-Sent Events fanout across processes, over Redis Pub/Sub.
+Server-Sent Events fanout across processes over Redis Pub/Sub.
 
 A client's connection stream lands on whichever process the load balancer picked.
 This makes it reachable from every other one.
