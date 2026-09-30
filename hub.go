@@ -14,10 +14,11 @@ import (
 )
 
 type Config struct {
-	Channel string        `json:"channel"` // namespace of the channels, "sse"
-	TTL     time.Duration `json:"ttl"`     // how long a socket claim outlives its refresher
-	Renew   time.Duration `json:"renew"`   // how often the holder refreshes the claim and beats
-	Pod     string        `json:"pod"`     // identity of this process
+	Channel   string        `json:"channel"`   // namespace of the channels, "sse"
+	TTL       time.Duration `json:"ttl"`       // how long a socket claim outlives its refresher
+	Renew     time.Duration `json:"renew"`     // how often the holder refreshes the claim
+	Heartbeat time.Duration `json:"heartbeat"` // how often a quiet response is beaten, so a proxy does not close it
+	Pod       string        `json:"pod"`       // identity of this process
 
 	event string
 }
@@ -31,6 +32,9 @@ func (s Config) WithDefaults() Config {
 	}
 	if s.Renew == 0 {
 		s.Renew = 20 * time.Second
+	}
+	if s.Heartbeat == 0 {
+		s.Heartbeat = 5 * time.Second
 	}
 	return s
 }
@@ -151,19 +155,25 @@ func (s *Hub[K, T]) Publish(ctx context.Context, users []K, value T) error {
 	var payload jsontext.Value
 
 	for _, user := range users {
-		if s.Sockets.IsHolder(user) {
+		k := user.String()
+
+		here := s.Sockets.IsHolder(user)
+		if here {
 			s.Sockets.PublishTo(user, value)
 		}
-
-		k := user.String()
 
 		claim, err := s.Owner.Get(ctx, k)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		if !claim.IsZero() && claim.Pod == s.Config.Pod {
+		if here && !claim.IsZero() && claim.Pod == s.Config.Pod {
 			continue // written above, no hop needed
+		}
+
+		stale := !claim.IsZero() && claim.Pod == s.Config.Pod
+		if stale {
+			slog.WarnContext(ctx, "stale sse claim names this pod, broadcasting instead", "user", k, "event", s.Config.event)
 		}
 
 		if payload == nil {
@@ -174,7 +184,7 @@ func (s *Hub[K, T]) Publish(ctx context.Context, users []K, value T) error {
 
 		envelope := Envelope{User: k, Event: s.Config.event, Payload: payload}
 		channel := s.Config.eventChannel()
-		if !claim.IsZero() {
+		if !claim.IsZero() && !stale {
 			channel = s.Config.keyUserChannel(k)
 		}
 		errs = append(errs, s.PubSub.Publish(ctx, channel, envelope))

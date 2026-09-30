@@ -2,6 +2,7 @@ package ssefanout
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"strconv"
@@ -38,6 +39,11 @@ func (r *recorder) String() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return string(r.data)
+}
+
+// body is what the response carries besides the heartbeats, which can land between any two writes.
+func (r *recorder) body() string {
+	return strings.ReplaceAll(r.String(), string(heartbeat), "")
 }
 
 // errWriter is a response whose client is gone: nothing can be written into it.
@@ -173,12 +179,12 @@ func waitFor(t *testing.T, r *recorder, want string) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if got := r.String(); got == want {
+		if got := r.body(); got == want {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Errorf("got %q, want %q", r.String(), want)
+	t.Errorf("got %q, want %q", r.body(), want)
 }
 
 func assertQuiet(t *testing.T, broker *redis.PubSub) {
@@ -285,6 +291,34 @@ func TestPublishFallsBackToTheEventChannel(t *testing.T) {
 	}
 }
 
+// A claim that names this pod while its socket is gone is stale, and the user channel it points at
+// reaches nobody: the event goes out as a broadcast instead of being swallowed.
+func TestPublishBroadcastsWhenTheClaimNamesThisPodWithoutASocket(t *testing.T) {
+	p := newPod(t, "pod-a", newNamespace(t), Config{TTL: time.Minute, Renew: time.Second})
+	ctx := t.Context()
+
+	messages := eventHub[string](t, p, "message")
+	if _, err := p.owner.Claim(ctx, "alice", NewSocketID()); err != nil {
+		t.Fatal(err)
+	}
+
+	eventChannel := p.config.WithEvent("message").eventChannel()
+	broker := p.broker(t, eventChannel, p.config.keyUserChannel("alice"))
+
+	if err := messages.Publish(ctx, []user{"alice"}, "hello"); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case m := <-broker.Channel():
+		if m.Channel != eventChannel {
+			t.Error("the event went to", m.Channel)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a stale claim naming this pod swallowed the event")
+	}
+}
+
 // One call, two users: the one this process holds is written straight into its response, the one
 // another process holds takes the hop. Both receive the event, and neither receives it twice.
 func TestPublishWritesOneUserLocallyAndTheOtherThroughRedis(t *testing.T) {
@@ -331,7 +365,7 @@ func TestPublishWithoutTheClaimWritesTwice(t *testing.T) {
 	waitFor(t, out, frame+frame)
 
 	time.Sleep(300 * time.Millisecond)
-	if got := out.String(); got != frame+frame {
+	if got := out.body(); got != frame+frame {
 		t.Error("got", got, "want", frame+frame)
 	}
 }
@@ -377,22 +411,71 @@ func TestKickEndsEveryEventOfTheSocket(t *testing.T) {
 	}
 }
 
-// A silent response is closed by the proxies in front of it, so the tick that refreshes the claim
-// writes a heartbeat into the response as well.
+// The response stays silent until the first frame or beat reaches it, and a proxy in front of it
+// reads that silence as an origin that never answered: the first beat leaves before the first tick.
+func TestSocketBeatsBeforeTheFirstTick(t *testing.T) {
+	p := newPod(t, "pod-a", newNamespace(t), Config{TTL: time.Minute, Heartbeat: time.Hour})
+
+	out := &recorder{}
+	socketOf(t, p, "alice", out, eventHub[string](t, p, "message"))
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && !strings.Contains(out.String(), string(heartbeat)) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := strings.Count(out.String(), string(heartbeat)); got != 1 {
+		t.Error("got", got, "heartbeats before the first tick, want one")
+	}
+}
+
+// A response carries nothing until a frame or a beat reaches it, and a proxy in front of it reads
+// that silence as an origin that never answered, so the first beat goes out at once and the rest
+// keep coming on the heartbeat's own schedule rather than the claim's.
 func TestSocketWritesTheHeartbeat(t *testing.T) {
-	p := newPod(t, "pod-a", newNamespace(t), Config{TTL: time.Minute, Renew: 50 * time.Millisecond})
+	p := newPod(t, "pod-a", newNamespace(t), Config{TTL: time.Minute, Heartbeat: 50 * time.Millisecond})
 
 	out := &recorder{}
 	socketOf(t, p, "alice", out, eventHub[string](t, p, "message"))
 
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if strings.Contains(out.String(), ": heartbeat\n\n") {
-			return
-		}
+	for time.Now().Before(deadline) && strings.Count(out.String(), string(heartbeat)) < 2 {
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Error("no heartbeat was written into the response")
+	if got := strings.Count(out.String(), string(heartbeat)); got < 2 {
+		t.Error("got", got, "heartbeats, want one at once and one on the tick")
+	}
+}
+
+// refreshFailure is an owner whose refresher is down: the claim cannot be extended, which is not a
+// reason for the response to go quiet as well.
+type refreshFailure struct {
+	OwnerRedis
+}
+
+func (refreshFailure) Refresh(context.Context, string, SocketID) (bool, error) {
+	return false, errors.New("the refresher is down")
+}
+
+// The claim refresh and the beats are separate: a refresh that fails leaves the beats coming, so
+// the client does not read a live stream as a dead one.
+func TestSocketKeepsBeatingWhenTheClaimCannotBeRefreshed(t *testing.T) {
+	p := newPod(t, "pod-a", newNamespace(t), Config{TTL: time.Minute, Renew: 200 * time.Millisecond, Heartbeat: 50 * time.Millisecond})
+
+	messages := eventHub[string](t, p, "message")
+	out := &recorder{}
+	sock := NewSocket(p.config, p.connection, refreshFailure{OwnerRedis: p.owner}, user("alice"), out)
+	messages.Join(user("alice"), sock)
+	if err := sock.Subscribe(p.ctx); err != nil {
+		t.Fatal(err)
+	}
+	p.sockets = append(p.sockets, sock)
+
+	time.Sleep(400 * time.Millisecond)
+
+	if got := strings.Count(out.String(), string(heartbeat)); got < 3 {
+		t.Error("got", got, "heartbeats while the claim could not be refreshed, want the beats to keep coming")
+	}
+	assertAlive(t, sock)
 }
 
 // The claim is a lease, so the holder keeps it alive: it survives its own TTL while the response
@@ -496,7 +579,7 @@ func TestSocketDropsAnEventItDoesNotCarry(t *testing.T) {
 	}
 
 	time.Sleep(300 * time.Millisecond)
-	if got := out.String(); got != "" {
+	if got := out.body(); got != "" {
 		t.Error("the response got an event the socket does not carry", got)
 	}
 	assertAlive(t, sock)
@@ -540,21 +623,22 @@ func TestSocketDropsAPayloadItCannotDecode(t *testing.T) {
 	}
 
 	time.Sleep(300 * time.Millisecond)
-	if got := out.String(); got != "" {
+	if got := out.body(); got != "" {
 		t.Error("the response got an event that cannot be decoded", got)
 	}
 	assertAlive(t, sock)
 }
 
 // The response stops taking writes part way through a frame: whether the value or the trailing
-// separator is the write that fails, the socket ends and stops holding the user.
+// separator is the write that fails, the socket ends and stops holding the user. Both responses
+// spend their first write on the heartbeat that opens the stream.
 func TestSocketEndsWhenTheResponseStopsAcceptingWrites(t *testing.T) {
 	p := newPod(t, "pod-a", newNamespace(t), Config{TTL: time.Minute, Renew: time.Second})
 	ctx := t.Context()
 
 	messages := eventHub[string](t, p, "message")
-	alice := socketOf(t, p, "alice", &failAfter{n: 1}, messages)
-	bob := socketOf(t, p, "bob", &failAfter{n: 2}, messages)
+	alice := socketOf(t, p, "alice", &failAfter{n: 2}, messages)
+	bob := socketOf(t, p, "bob", &failAfter{n: 3}, messages)
 
 	if err := messages.Publish(ctx, []user{"alice", "bob"}, "hello"); err != nil {
 		t.Fatal(err)
@@ -597,7 +681,7 @@ func TestSocketFlushesWhenTheResponseCan(t *testing.T) {
 
 func TestConfigDefaults(t *testing.T) {
 	config := Config{}.WithDefaults()
-	if config.Channel != "sse" || config.TTL != time.Minute || config.Renew != 20*time.Second {
+	if config.Channel != "sse" || config.TTL != time.Minute || config.Renew != 20*time.Second || config.Heartbeat != 5*time.Second {
 		t.Error("got", config, "want the defaults")
 	}
 	if got := config.eventChannel(); got != "sse" {

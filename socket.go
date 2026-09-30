@@ -99,6 +99,8 @@ func (s *Socket[K]) Subscribe(ctx context.Context) error {
 
 	go s.follow(ctx, channel)
 	go s.serve(ctx)
+
+	slog.InfoContext(ctx, "sse socket subscribed", "user", k, "socket", socket.String())
 	return nil
 }
 
@@ -128,8 +130,17 @@ func (s *Socket[K]) write(event string, encode func(io.Writer) error) error {
 // serve writes what the queue carries into the response, beats, and keeps the ownership alive.
 func (s *Socket[K]) serve(ctx context.Context) {
 	k := s.user.String()
-	ticker := time.NewTicker(s.Config.Renew)
-	defer ticker.Stop()
+
+	renew := time.NewTicker(s.Config.Renew)
+	defer renew.Stop()
+
+	beat := time.NewTicker(s.Config.Heartbeat)
+	defer beat.Stop()
+
+	if err := s.writeHeartbeat(); err != nil {
+		s.end(ctx)
+		return
+	}
 
 	for {
 		select {
@@ -142,7 +153,7 @@ func (s *Socket[K]) serve(ctx context.Context) {
 				s.end(ctx)
 				return
 			}
-		case <-ticker.C:
+		case <-renew.C:
 			held, err := s.Owner.Refresh(ctx, k, s.socket)
 			if err != nil {
 				if ctx.Err() != nil {
@@ -157,6 +168,7 @@ func (s *Socket[K]) serve(ctx context.Context) {
 				s.end(ctx)
 				return
 			}
+		case <-beat.C:
 			if err := s.writeHeartbeat(); err != nil {
 				s.end(ctx)
 				return
@@ -280,4 +292,6 @@ func (s *Socket[K]) end(ctx context.Context) {
 		s.cancel()
 	}
 	close(s.done)
+
+	slog.InfoContext(ctx, "sse socket ended", "user", k, "socket", s.socket.String())
 }
